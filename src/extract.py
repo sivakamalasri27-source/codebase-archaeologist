@@ -1,25 +1,37 @@
 """Git history extraction and GitHub API integration module.
 
-Week 1 Component of Codebase Archaeologist:
+Week 1 / Week 4 Component of Codebase Archaeologist:
 - Extracts commit logs, file changes, and Python diffs using PyDriller.
 - Fetches PR descriptions and issue discussions using GitHub REST API.
-- Caches API responses locally to prevent rate limiting.
+- Caches API responses locally in JSON to prevent hitting rate limits.
+- fetch_all_pr_details(): scans commit messages for (#NNN) references,
+  fetches any missing PRs + linked issues from GitHub, updates cache.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from pydriller import Repository
-import requests
+import requests as http_requests
 
 # Load environment variables from .env file if present
 load_dotenv()
+
+# Regex: match PR references like "(#7502)" or "#7502" in commit messages
+_PR_REF_RE = re.compile(r"\(#(\d+)\)|(?<!\w)#(\d+)")
+# Regex: match issue links in PR bodies like "Fixes #123", "Closes #456"
+_ISSUE_LINK_RE = re.compile(
+    r"(?:fixes|closes|resolves|fix|close|resolve)\s+#(\d+)",
+    re.IGNORECASE,
+)
 
 
 def extract_commits(
@@ -43,15 +55,18 @@ def extract_commits(
         - changed_files (list[str]): List of all modified/added/deleted file paths.
         - python_diffs (list[dict[str, str]]): List of diffs for modified .py files,
           each containing 'path' and 'diff' text.
+
+    Plain English: We walk through every commit in the repo using PyDriller.
+    For each commit we record who made it, when, what message they left, and
+    what Python files changed along with their diff text.
+    We stop at max_commits to keep indexing fast during development.
     """
     extracted_commits: list[dict[str, Any]] = []
 
     # Traverse commits in repository
     repo = Repository(repo_path, order=order)
     for commit in repo.traverse_commits():
-        # Collect all changed files across this commit
         all_changed_files: list[str] = []
-        # Collect diffs only for Python source files
         python_diffs: list[dict[str, str]] = []
 
         try:
@@ -61,7 +76,6 @@ def extract_commits(
             continue
 
         for modified_file in modified_files:
-            # Resolve relative file path (prefer new_path for additions/modifications)
             file_path = (
                 modified_file.new_path
                 or modified_file.old_path
@@ -70,7 +84,6 @@ def extract_commits(
             if file_path:
                 all_changed_files.append(file_path)
 
-            # Check if modified file is a Python script
             is_python_file = (
                 (modified_file.filename and modified_file.filename.endswith(".py"))
                 or (file_path and file_path.endswith(".py"))
@@ -110,19 +123,14 @@ def fetch_pr_and_issue_text(
         owner: GitHub repository owner (e.g., 'psf').
         repo: GitHub repository name (e.g., 'requests').
         token: GitHub Personal Access Token (defaults to GITHUB_TOKEN in .env).
-        cache_path: Filepath for the JSON cache. Defaults to '{owner}_{repo}_github_cache.json'.
+        cache_path: Filepath for the JSON cache.
         per_page: Number of items to retrieve per API request (max 100).
 
     Returns:
-        A dictionary containing:
-        - repo: Full repository name ('owner/repo')
-        - pull_requests: List of PR dicts (number, title, body, author, state, url)
-        - issues: List of Issue dicts (number, title, body, author, state, comments_count, url)
+        A dictionary containing repo, pull_requests, and issues lists.
     """
-    # Default cache path in current working directory
     resolved_cache = Path(cache_path) if cache_path else Path(f"{owner}_{repo}_github_cache.json")
 
-    # If cache exists, return cached data to avoid rate limits
     if resolved_cache.exists():
         print(f"[CACHE HIT] Loading GitHub data from {resolved_cache.resolve()}")
         with open(resolved_cache, "r", encoding="utf-8") as f:
@@ -130,23 +138,14 @@ def fetch_pr_and_issue_text(
 
     print(f"[CACHE MISS] Fetching fresh data from GitHub REST API for {owner}/{repo}...")
 
-    # Resolve authorization token
     auth_token = token or os.getenv("GITHUB_TOKEN")
-    headers: dict[str, str] = {
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
-    else:
-        print("[WARN] No GITHUB_TOKEN found. Requests will be limited to unauthenticated quota (60 req/hr).")
-
+    headers = _build_headers(auth_token)
     base_url = f"https://api.github.com/repos/{owner}/{repo}"
 
     # 1. Fetch Pull Requests
     pull_requests: list[dict[str, Any]] = []
     try:
-        pr_response = requests.get(
+        pr_response = http_requests.get(
             f"{base_url}/pulls",
             headers=headers,
             params={"state": "all", "per_page": per_page, "sort": "updated", "direction": "desc"},
@@ -154,25 +153,16 @@ def fetch_pr_and_issue_text(
         )
         if pr_response.status_code == 200:
             for pr in pr_response.json():
-                pull_requests.append({
-                    "number": pr.get("number"),
-                    "title": pr.get("title", ""),
-                    "body": pr.get("body") or "",
-                    "author": pr.get("user", {}).get("login", "") if pr.get("user") else "",
-                    "state": pr.get("state", ""),
-                    "created_at": pr.get("created_at", ""),
-                    "merged_at": pr.get("merged_at"),
-                    "html_url": pr.get("html_url", ""),
-                })
+                pull_requests.append(_normalise_pr(pr))
         else:
-            print(f"[API ERROR] Pull Requests fetch returned status {pr_response.status_code}: {pr_response.text[:200]}")
-    except requests.RequestException as err:
+            print(f"[API ERROR] Pull Requests fetch returned status {pr_response.status_code}")
+    except http_requests.RequestException as err:
         print(f"[REQUEST ERROR] Failed fetching pull requests: {err}")
 
-    # 2. Fetch Issues (excluding PRs, as GitHub API returns PRs in issues endpoint)
+    # 2. Fetch Issues (excluding PRs)
     issues: list[dict[str, Any]] = []
     try:
-        issue_response = requests.get(
+        issue_response = http_requests.get(
             f"{base_url}/issues",
             headers=headers,
             params={"state": "all", "per_page": per_page, "sort": "updated", "direction": "desc"},
@@ -180,23 +170,12 @@ def fetch_pr_and_issue_text(
         )
         if issue_response.status_code == 200:
             for item in issue_response.json():
-                # GitHub issues endpoint includes pull requests; check for 'pull_request' key
                 if "pull_request" in item:
                     continue
-
-                issues.append({
-                    "number": item.get("number"),
-                    "title": item.get("title", ""),
-                    "body": item.get("body") or "",
-                    "author": item.get("user", {}).get("login", "") if item.get("user") else "",
-                    "state": item.get("state", ""),
-                    "comments_count": item.get("comments", 0),
-                    "created_at": item.get("created_at", ""),
-                    "html_url": item.get("html_url", ""),
-                })
+                issues.append(_normalise_issue(item))
         else:
-            print(f"[API ERROR] Issues fetch returned status {issue_response.status_code}: {issue_response.text[:200]}")
-    except requests.RequestException as err:
+            print(f"[API ERROR] Issues fetch returned status {issue_response.status_code}")
+    except http_requests.RequestException as err:
         print(f"[REQUEST ERROR] Failed fetching issues: {err}")
 
     result_data: dict[str, Any] = {
@@ -205,15 +184,207 @@ def fetch_pr_and_issue_text(
         "issues": issues,
     }
 
-    # Save to local JSON cache
-    try:
-        with open(resolved_cache, "w", encoding="utf-8") as f:
-            json.dump(result_data, f, indent=2, ensure_ascii=False)
-        print(f"[CACHE SAVED] Saved {len(pull_requests)} PRs and {len(issues)} issues to {resolved_cache.resolve()}")
-    except OSError as err:
-        print(f"[CACHE WRITE ERROR] Failed saving cache file: {err}")
-
+    _save_cache(resolved_cache, result_data)
     return result_data
+
+
+def fetch_all_pr_details(
+    commits: list[dict[str, Any]],
+    owner: str,
+    repo: str,
+    cache_path: str | Path,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """Fetch every PR referenced in commit messages, plus any issues they link.
+
+    Args:
+        commits: List of commit dicts from extract_commits().
+        owner: GitHub repo owner, e.g. 'psf'.
+        repo: GitHub repo name, e.g. 'requests'.
+        cache_path: Path to the JSON cache file (created if absent).
+        token: GitHub PAT; falls back to GITHUB_TOKEN env var.
+
+    Returns:
+        Updated pr_cache dict with pull_requests and issues lists.
+
+    Plain English:
+    1. Scan every commit message for patterns like "(#7502)".
+    2. For each PR number NOT yet in cache, fetch title and body from GitHub.
+       If rate-limited (403/429), sleeps and retries. If unauthenticated limit
+       is exhausted, safely halts remote calls and preserves cache.
+    3. If PR body says "Fixes #123" or "Closes #123", fetch that issue too.
+    4. Automatically writes updated cache to JSON so runs resume seamlessly.
+    """
+    resolved_cache = Path(cache_path)
+    auth_token = token or os.getenv("GITHUB_TOKEN")
+    headers = _build_headers(auth_token)
+    base_url = f"https://api.github.com/repos/{owner}/{repo}"
+
+    # Load existing cache (or start fresh)
+    if resolved_cache.exists():
+        with open(resolved_cache, encoding="utf-8") as f:
+            cache: dict[str, Any] = json.load(f)
+    else:
+        cache = {"repo": f"{owner}/{repo}", "pull_requests": [], "issues": []}
+
+    cached_pr_nums: set[int] = {pr["number"] for pr in cache.get("pull_requests", []) if pr.get("number")}
+    cached_issue_nums: set[int] = {iss["number"] for iss in cache.get("issues", []) if iss.get("number")}
+
+    # Collect PR numbers referenced in commit messages
+    referenced_pr_nums: set[int] = set()
+    for c in commits:
+        msg = c.get("message", "") or ""
+        for m in _PR_REF_RE.finditer(msg):
+            num = int(m.group(1) or m.group(2))
+            referenced_pr_nums.add(num)
+
+    missing_prs = sorted(referenced_pr_nums - cached_pr_nums)
+    print(f"[fetch_all_pr_details] {len(referenced_pr_nums)} PR references in commits. "
+          f"{len(cached_pr_nums)} already cached, {len(missing_prs)} to fetch.")
+
+    newly_fetched_prs = 0
+    newly_fetched_issues = 0
+
+    for idx, pr_num in enumerate(missing_prs, 1):
+        pr_data, hit_limit = _github_get(f"{base_url}/pulls/{pr_num}", headers)
+        if hit_limit:
+            print(f"[fetch_all_pr_details] Rate limit reached. Stopping further fetches.")
+            break
+        if pr_data is None:
+            continue
+
+        normalised = _normalise_pr(pr_data)
+        cache.setdefault("pull_requests", []).append(normalised)
+        cached_pr_nums.add(pr_num)
+        newly_fetched_prs += 1
+        print(f"  [{idx}/{len(missing_prs)}] PR #{pr_num}: {normalised['title'][:60]}")
+
+        # Scan for linked issues
+        body = normalised.get("body", "") or ""
+        for issue_match in _ISSUE_LINK_RE.finditer(body):
+            issue_num = int(issue_match.group(1))
+            if issue_num in cached_issue_nums:
+                continue
+            issue_data, hit_limit_iss = _github_get(f"{base_url}/issues/{issue_num}", headers)
+            if hit_limit_iss:
+                break
+            if issue_data and "pull_request" not in issue_data:
+                cache.setdefault("issues", []).append(_normalise_issue(issue_data))
+                cached_issue_nums.add(issue_num)
+                newly_fetched_issues += 1
+                print(f"    -> Linked Issue #{issue_num}: {issue_data.get('title','')[:50]}")
+
+        # Persist after each PR so progress is never lost
+        _save_cache(resolved_cache, cache)
+
+    print(f"[fetch_all_pr_details] Done. Fetched {newly_fetched_prs} new PRs and "
+          f"{newly_fetched_issues} new issues. Cache now has "
+          f"{len(cache['pull_requests'])} PRs and {len(cache['issues'])} issues.")
+
+    return cache
+
+
+# ---------------------------------------------------------------------------
+# Private helpers
+# ---------------------------------------------------------------------------
+
+def _build_headers(auth_token: str | None) -> dict[str, str]:
+    """Build standard GitHub API request headers."""
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if auth_token and auth_token.strip() and auth_token.strip() != "your_token_here":
+        headers["Authorization"] = f"Bearer {auth_token.strip()}"
+    else:
+        print("[WARN] No valid GITHUB_TOKEN found. GitHub rate limit: 60 req/hr.")
+    return headers
+
+
+def _github_get(
+    url: str,
+    headers: dict[str, str],
+    max_retries: int = 3,
+) -> tuple[dict[str, Any] | None, bool]:
+    """GET a single GitHub API URL with exponential back-off on 403/429.
+
+    Returns:
+        tuple (data_dict_or_None, rate_limit_hit_bool)
+    """
+    delay = 5
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = http_requests.get(url, headers=headers, timeout=15)
+        except http_requests.RequestException as err:
+            print(f"  [HTTP ERROR] {url}: {err}")
+            return None, False
+
+        if resp.status_code == 200:
+            return resp.json(), False
+
+        if resp.status_code in (403, 429):
+            rem = resp.headers.get("x-ratelimit-remaining")
+            reset = resp.headers.get("x-ratelimit-reset")
+            retry_after = resp.headers.get("Retry-After")
+
+            if rem == "0" and reset:
+                now = time.time()
+                wait_sec = max(0, int(reset) - int(now)) + 1
+                if wait_sec > 120 and "Authorization" not in headers:
+                    print(f"  [RATE LIMIT] Unauthenticated GitHub rate limit exhausted (resets in {wait_sec}s).")
+                    print("  [TIP] Provide a GITHUB_TOKEN in .env to enable 5,000 requests/hr.")
+                    return None, True
+
+            wait = int(retry_after) if retry_after and retry_after.isdigit() else delay
+            print(f"  [RATE LIMIT] {resp.status_code} on {url}. Waiting {wait}s (retry {attempt}/{max_retries}) ...")
+            time.sleep(wait)
+            delay = min(delay * 2, 60)
+            continue
+
+        if resp.status_code == 404:
+            return None, False
+
+        print(f"  [API ERROR] {resp.status_code} for {url}: {resp.text[:200]}")
+        return None, False
+
+    return None, True
+
+
+def _normalise_pr(pr: dict[str, Any]) -> dict[str, Any]:
+    """Extract standard fields from a raw GitHub PR object."""
+    return {
+        "number": pr.get("number"),
+        "title": pr.get("title", ""),
+        "body": pr.get("body") or "",
+        "author": (pr.get("user") or {}).get("login", ""),
+        "state": pr.get("state", ""),
+        "created_at": pr.get("created_at", ""),
+        "merged_at": pr.get("merged_at"),
+        "html_url": pr.get("html_url", ""),
+    }
+
+
+def _normalise_issue(item: dict[str, Any]) -> dict[str, Any]:
+    """Extract standard fields from a raw GitHub issue object."""
+    return {
+        "number": item.get("number"),
+        "title": item.get("title", ""),
+        "body": item.get("body") or "",
+        "author": (item.get("user") or {}).get("login", ""),
+        "state": item.get("state", ""),
+        "comments_count": item.get("comments", 0),
+        "created_at": item.get("created_at", ""),
+        "html_url": item.get("html_url", ""),
+    }
+
+
+def _save_cache(cache_path: Path, data: dict[str, Any]) -> None:
+    """Write cache data to disk as UTF-8 JSON."""
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except OSError as err:
+        print(f"[CACHE WRITE ERROR] {err}")
 
 
 def _ensure_sample_repo(target_dir: Path) -> Path:
@@ -232,10 +403,9 @@ def _ensure_sample_repo(target_dir: Path) -> Path:
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Codebase Archaeologist - Git Extraction Demo (Week 1)")
+    print("Codebase Archaeologist - Git Extraction Demo (Week 1 / Week 4)")
     print("=" * 70)
 
-    # 1. Prepare local clone of psf/requests for testing
     project_root = Path(__file__).resolve().parent.parent
     sample_repo_path = project_root / "repos" / "requests"
 
@@ -243,10 +413,8 @@ if __name__ == "__main__":
         _ensure_sample_repo(sample_repo_path)
     except Exception as exc:
         print(f"[SETUP NOTICE] Could not clone automatically ({exc}).")
-        print(f"Please clone psf/requests into: {sample_repo_path.resolve()}")
         sample_repo_path = Path(".")
 
-    # 2. Extract first 10 commits
     print(f"\nExtracting first 10 commits from {sample_repo_path} using PyDriller...")
     commits = extract_commits(str(sample_repo_path), max_commits=10)
 
@@ -257,22 +425,8 @@ if __name__ == "__main__":
         print(f"[{idx:02d}] {short_hash} | {c['date'][:10]} | {c['author']}")
         print(f"     Msg: {first_line_msg}")
         print(f"     Changed files ({len(c['changed_files'])}): {', '.join(c['changed_files'][:4])}")
-        if len(c["changed_files"]) > 4:
-            print(f"     ... + {len(c['changed_files']) - 4} more")
 
-        print(f"     Python diffs ({len(c['python_diffs'])}):")
-        for pydiff in c["python_diffs"][:2]:
-            lines = pydiff["diff"].splitlines()
-            snippet = "\n".join(lines[:3]) if lines else "(empty diff)"
-            print(f"       * {pydiff['path']}:\n         {snippet.replace(chr(10), chr(10) + '         ')}")
-        print("-" * 70)
-
-    # 3. Demonstrate PR and Issue fetcher with caching
     print("\nTesting GitHub PR & Issue retrieval with local cache...")
     demo_cache_path = project_root / "cache_github_requests.json"
-    data = fetch_pr_and_issue_text("psf", "requests", cache_path=demo_cache_path, per_page=5)
-    print(f"Fetched {len(data.get('pull_requests', []))} PRs and {len(data.get('issues', []))} Issues.")
-    if data.get("pull_requests"):
-        first_pr = data["pull_requests"][0]
-        print(f"Sample PR #{first_pr['number']}: {first_pr['title']} (by @{first_pr['author']})")
+    data = fetch_all_pr_details(commits, "psf", "requests", cache_path=demo_cache_path)
     print("=" * 70)

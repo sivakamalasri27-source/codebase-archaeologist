@@ -1,29 +1,39 @@
 """Vector indexing module for Codebase Archaeologist.
 
-Codebase Archaeologist - Week 3:
+Codebase Archaeologist - Week 3 / Week 4:
 - Builds two kinds of ChromaDB documents:
-    "commit"   — commit message + PR text, tagged with changed function identities.
-    "function" — function identity + source code + history summary.
+    "commit"   -- commit message + PR title/body + linked issue text.
+    "function" -- function identity + source code history summary.
 - Embeds with the free, local sentence-transformers model all-MiniLM-L6-v2.
 - Persists to ./chroma_db so the collection survives between runs.
-- Incremental: re-runs skip already-indexed documents (tracked by their document ID).
-- search(query, n) retrieves the top-n semantically similar documents with metadata.
+- Incremental with change detection: re-runs skip unchanged docs,
+  delete+re-embed docs whose text changed, add brand-new docs.
+- search(query, n) retrieves the top-n semantically similar documents.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Lazy imports — sentence-transformers and chromadb are heavy; keep at module
+# Lazy imports -- sentence-transformers and chromadb are heavy; keep at module
 # level but we import them once inside _load_model() / _get_collection().
 # ---------------------------------------------------------------------------
 _model = None          # cached SentenceTransformer instance
 _collection = None     # cached ChromaDB collection
+
+# Same regex as in extract.py -- finds (#NNN) or bare #NNN in commit messages
+_PR_REF_RE = re.compile(r"\(#(\d+)\)|(?<!\w)#(\d+)")
+# Finds issue links in PR bodies: "Fixes #123", "Closes #456", etc.
+_ISSUE_LINK_RE = re.compile(
+    r"(?:fixes|closes|resolves|fix|close|resolve)\s+#(\d+)",
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -36,7 +46,7 @@ def _load_model():
     Plain English: This function downloads the model the first time (about
     80 MB, stored in ~/.cache/huggingface) and then keeps it in memory so we
     don't reload it every call.  all-MiniLM-L6-v2 produces 384-dimensional
-    vectors and runs in CPU-only mode — no GPU, no API key needed.
+    vectors and runs in CPU-only mode -- no GPU, no API key needed.
     """
     global _model
     if _model is None:
@@ -53,7 +63,7 @@ def _get_collection(chroma_dir: str | Path):
     Plain English: ChromaDB stores vectors on disk in `chroma_dir`.  On the
     first run it creates the directory and an empty collection called
     'codebase_archaeologist'.  On every subsequent run it re-opens the same
-    collection, so old embeddings are still there — enabling incremental
+    collection, so old embeddings are still there -- enabling incremental
     indexing.
     """
     global _collection
@@ -69,10 +79,10 @@ def _get_collection(chroma_dir: str | Path):
 
 
 def _embed(texts: list[str]) -> list[list[float]]:
-    """Embed a list of text strings → list of float vectors.
+    """Embed a list of text strings -> list of float vectors.
 
     Plain English: We hand the texts to the in-memory SentenceTransformer
-    model in one batch call.  Batching is important — the model is a
+    model in one batch call.  Batching is important -- the model is a
     transformer, so encoding 100 texts at once is much faster than 100
     individual calls.  `convert_to_list` turns numpy arrays into plain Python
     lists so ChromaDB can serialise them.
@@ -94,48 +104,82 @@ def build_commit_documents(
 
     Args:
         commits: List of commit dicts returned by extract_commits().
-        pr_cache: Optional dict returned by fetch_pr_and_issue_text().
-                  Used to enrich commit documents with PR title + body text.
+        pr_cache: Optional dict returned by fetch_pr_and_issue_text() or
+                  fetch_all_pr_details().  Used to enrich commit documents
+                  with PR title + body + linked issue text.
 
     Returns:
         List of dicts with keys:
         - doc_id   : unique document ID (string "commit:<hash>")
-        - text     : the text to embed
+        - text     : the text to embed (commit msg + PR + issue context)
         - metadata : dict stored alongside the vector in ChromaDB
 
-    Plain English: We combine the commit message with any PR description that
-    matches via "#<number>" in the message.  The more context a document
-    carries, the better our later semantic search will be — a bare "Fix #1234"
-    is useless; with the PR body it explains what was actually broken.
+    Plain English: We combine the commit message with any matching PR
+    description and linked issue body.  The richer the text, the better
+    our semantic search will be -- "Fix #1234" alone is useless; with
+    PR title/body and the original issue it explains what was actually
+    broken and why the fix works.  We truncate PR bodies to 1500 chars
+    and issue bodies to 500 chars to stay within MiniLM's 256-token
+    window (the model silently truncates but shorter is safer).
     """
-    # Build a fast lookup: PR number (int) -> PR dict
+    # Build fast lookups: PR number (int) -> PR dict
     pr_by_number: dict[int, dict[str, Any]] = {}
+    # Issue number (int) -> issue dict
+    issue_by_number: dict[int, dict[str, Any]] = {}
+
     if pr_cache:
         for pr in pr_cache.get("pull_requests", []):
             if pr.get("number"):
                 pr_by_number[pr["number"]] = pr
+        for iss in pr_cache.get("issues", []):
+            if iss.get("number"):
+                issue_by_number[iss["number"]] = iss
 
     documents: list[dict[str, Any]] = []
+    pr_text_count = 0  # how many commits got PR context
+
     for c in commits:
         msg = c.get("message", "") or ""
-        # Try to find a PR number reference like (#1234) or #1234
-        pr_text = ""
-        for token in msg.replace("(", " ").replace(")", " ").split():
-            if token.startswith("#") and token[1:].isdigit():
-                pr_num = int(token[1:])
-                pr = pr_by_number.get(pr_num)
-                if pr:
-                    pr_text = f"\nPR: {pr.get('title', '')}\n{pr.get('body', '')[:800]}"
-                break
 
-        # The text we embed: commit message + optional PR context
-        text = f"Commit {c['hash'][:8]} by {c.get('author', '')}\n{msg}{pr_text}".strip()
+        # Find the first PR number referenced in the commit message
+        pr_title = ""
+        pr_body_snippet = ""
+        issue_snippet = ""
 
-        # Metadata stored verbatim (not embedded) — used to annotate results
-        changed_identities = []
-        for diff in c.get("python_diffs", []):
-            # Store the file path; full identities come from track.py histories
-            changed_identities.append(diff.get("path", ""))
+        for m in _PR_REF_RE.finditer(msg):
+            pr_num = int(m.group(1) or m.group(2))
+            pr = pr_by_number.get(pr_num)
+            if not pr:
+                continue
+
+            pr_title = pr.get("title", "")
+            pr_body_snippet = (pr.get("body", "") or "")[:1500]
+
+            # Look for linked issues inside the PR body
+            full_body = pr.get("body", "") or ""
+            for issue_m in _ISSUE_LINK_RE.finditer(full_body):
+                iss_num = int(issue_m.group(1))
+                iss = issue_by_number.get(iss_num)
+                if iss:
+                    iss_title = iss.get("title", "")
+                    iss_body = (iss.get("body", "") or "")[:500]
+                    issue_snippet += f"\nLinked issue #{iss_num}: {iss_title}\n{iss_body}"
+            break  # only use the first matched PR per commit
+
+        # Build the text we will embed
+        parts = [f"Commit {c['hash'][:8]} by {c.get('author', '')}", msg]
+        if pr_title:
+            parts.append(f"PR: {pr_title}")
+            pr_text_count += 1
+        if pr_body_snippet:
+            parts.append(pr_body_snippet)
+        if issue_snippet:
+            parts.append(issue_snippet.strip())
+
+        text = "\n".join(parts).strip()
+
+        # Metadata stored verbatim (not embedded) -- annotates search results
+        changed_identities = [diff.get("path", "") for diff in c.get("python_diffs", [])]
 
         documents.append({
             "doc_id": f"commit:{c['hash']}",
@@ -147,10 +191,16 @@ def build_commit_documents(
                 "date": c.get("date", ""),
                 "author": c.get("author", ""),
                 "message": msg.splitlines()[0] if msg else "",
-                # ChromaDB metadata values must be str/int/float/bool — join lists
+                # ChromaDB metadata values must be str/int/float/bool -- join lists
                 "changed_files": ", ".join(changed_identities[:10]),
             },
         })
+
+    total = len(commits)
+    pct = 100.0 * pr_text_count / total if total else 0.0
+    print(f"[build_commit_documents] Commits with PR text: "
+          f"{pr_text_count}/{total} ({pct:.1f}%)")
+
     return documents
 
 
@@ -171,7 +221,7 @@ def build_function_documents(
        Add inline types to Requests")
     3. The commit messages of every commit that touched it.
 
-    We do NOT embed the full source code — MiniLM has a 256-token limit and
+    We do NOT embed the full source code -- MiniLM has a 256-token limit and
     source code doesn't describe *why* something changed.  The commit messages
     and PR text do.
     """
@@ -182,7 +232,7 @@ def build_function_documents(
         aliases = hist.aliases   # list[str]
 
         if not commits:
-            continue   # never actually changed — skip
+            continue   # never actually changed -- skip
 
         last = commits[-1]
         # Summarise: who changed it, how often, and with what messages
@@ -228,49 +278,67 @@ def index_documents(
     documents: list[dict[str, Any]],
     chroma_dir: str | Path = "./chroma_db",
 ) -> dict[str, int]:
-    """Embed and store documents in ChromaDB, skipping already-indexed ones.
+    """Embed and store documents in ChromaDB with change detection.
 
     Args:
         documents: List of dicts with doc_id, text, metadata.
         chroma_dir: Path where ChromaDB persists its data.
 
     Returns:
-        A dict {"added": N, "skipped": M} reporting what happened.
+        A dict {"added": N, "changed": C, "skipped": M} reporting what happened.
 
-    Plain English: We first ask ChromaDB which doc_ids it already has.  Any
-    document whose ID is already present is skipped — this is the incremental
-    indexing mechanism.  The new documents are batched (100 at a time) so we
-    don't hold huge numpy arrays in memory at once.  ChromaDB's `upsert` both
-    adds new documents and updates existing ones if the same ID is re-submitted
-    (but we avoid re-submitting existing IDs for speed).
+    Plain English: We first ask ChromaDB which doc_ids it already has AND
+    what text they store.  Then we compare stored text vs. new text:
+    - If a doc_id is brand new: embed and add it.
+    - If the text changed (e.g. because we added PR context): delete the old
+      embedding and re-embed with the new richer text.
+    - If the text is identical: skip entirely (truly incremental).
+    This means re-running after a PR-enrichment step will only re-embed the
+    documents that actually gained new PR text, not all 596.
     """
     collection = _get_collection(chroma_dir)
 
-    # Find which document IDs already exist in the collection
-    if documents:
-        all_ids = [d["doc_id"] for d in documents]
-        existing = set()
-        # ChromaDB's get() can filter by IDs in one call
-        try:
-            result = collection.get(ids=all_ids, include=[])
-            existing = set(result["ids"])
-        except Exception:
-            existing = set()
+    if not documents:
+        return {"added": 0, "changed": 0, "skipped": 0}
 
-        new_docs = [d for d in documents if d["doc_id"] not in existing]
-    else:
-        new_docs = []
+    all_ids = [d["doc_id"] for d in documents]
 
-    skipped = len(documents) - len(new_docs)
+    # Fetch stored text for every ID that already exists in ChromaDB
+    stored_text_by_id: dict[str, str] = {}
+    try:
+        result = collection.get(ids=all_ids, include=["documents"])
+        for doc_id, stored_text in zip(result["ids"], result["documents"]):
+            stored_text_by_id[doc_id] = stored_text
+    except Exception:
+        pass  # collection empty or other issue -- treat everything as new
+
+    new_docs: list[dict[str, Any]] = []
+    changed_docs: list[dict[str, Any]] = []
+    skipped = 0
+
+    for d in documents:
+        stored = stored_text_by_id.get(d["doc_id"])
+        if stored is None:
+            new_docs.append(d)
+        elif stored != d["text"]:
+            changed_docs.append(d)
+        else:
+            skipped += 1
+
+    print(f"[index_documents] New: {len(new_docs)}, "
+          f"Changed: {len(changed_docs)}, Skipped: {skipped}")
+
+    # Delete the stale embeddings for changed documents before re-embedding
+    if changed_docs:
+        collection.delete(ids=[d["doc_id"] for d in changed_docs])
+
+    # Embed and upsert new + changed documents together in batches of 100
+    to_embed = new_docs + changed_docs
     added = 0
-
-    if not new_docs:
-        return {"added": 0, "skipped": skipped}
-
-    # Batch embed + upsert in chunks of 100
     batch_size = 100
-    for start in range(0, len(new_docs), batch_size):
-        batch = new_docs[start : start + batch_size]
+
+    for start in range(0, len(to_embed), batch_size):
+        batch = to_embed[start: start + batch_size]
         texts = [d["text"] for d in batch]
         embeddings = _embed(texts)
 
@@ -281,9 +349,9 @@ def index_documents(
             metadatas=[d["metadata"] for d in batch],
         )
         added += len(batch)
-        print(f"[index] Indexed {min(start + batch_size, len(new_docs))}/{len(new_docs)} new documents ...")
+        print(f"[index] Indexed {min(start + batch_size, len(to_embed))}/{len(to_embed)} docs ...")
 
-    return {"added": added, "skipped": skipped}
+    return {"added": len(new_docs), "changed": len(changed_docs), "skipped": skipped}
 
 
 # ---------------------------------------------------------------------------
@@ -302,7 +370,7 @@ def search(
         query: Natural-language question, e.g. "why was _encode_files changed".
         n: Number of results to return.
         chroma_dir: Path to the persistent ChromaDB directory.
-        doc_type: Optional filter — "commit", "function", or None (search all).
+        doc_type: Optional filter -- "commit", "function", or None (search all).
 
     Returns:
         List of result dicts with keys: doc_id, text, metadata, distance.
@@ -344,16 +412,39 @@ def search(
     return hits
 
 
+def _print_results(query: str, results: list[dict[str, Any]]) -> None:
+    """Pretty-print search results to stdout."""
+    print(f"\n{'='*72}")
+    print(f"  SEARCH: \"{query}\"")
+    print(f"{'='*72}")
+    if not results:
+        print("  No results found.")
+        return
+    for rank, hit in enumerate(results, 1):
+        m = hit["metadata"]
+        print(f"\n  [{rank}] dist={hit['distance']:.4f}  type={m.get('type','?')}")
+        if m.get("type") == "commit":
+            print(f"       {m.get('short_hash','')}  {m.get('date','')[:10]}  {m.get('author','')}")
+            print(f"       {m.get('message','')}")
+            if m.get("changed_files"):
+                print(f"       Files: {m['changed_files'][:80]}")
+        elif m.get("type") == "function":
+            print(f"       {m.get('identity','')}")
+            print(f"       Changed {m.get('num_commits',0)}x, last by {m.get('last_author','')} on {m.get('last_date','')}")
+            print(f"       {m.get('last_message','')}")
+        snippet = "\n".join(hit["text"].splitlines()[:2])
+        print(f"       >> {snippet}")
+    print(f"\n{'='*72}")
+
+
 # ---------------------------------------------------------------------------
 # __main__ demo
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import sys
     sys.path.insert(0, str(Path(__file__).parent))
 
-    from extract import extract_commits
-    from parse import parse_definitions
+    from extract import extract_commits, fetch_all_pr_details
     from track import build_function_histories
 
     project_root = Path(__file__).resolve().parent.parent
@@ -367,30 +458,31 @@ if __name__ == "__main__":
 
     total_start = time.time()
 
-    # 1. Load commits (extract step)
-    print("\n[1/4] Extracting commits ...")
+    # 1. Load commits
+    print("\n[1/5] Extracting commits ...")
     t = time.time()
     commits = extract_commits(str(repo_path), max_commits=300)
     print(f"      {len(commits)} commits loaded in {time.time()-t:.1f}s")
 
-    # 2. Load PR/issue cache for enrichment (may be empty if no network run yet)
-    pr_cache: dict[str, Any] | None = None
-    if cache_path.exists():
-        with open(cache_path, encoding="utf-8") as f:
-            pr_cache = json.load(f)
-        n_prs = len((pr_cache or {}).get("pull_requests", []))
-        print(f"      Loaded PR cache with {n_prs} PRs from {cache_path.name}")
-    else:
-        print(f"      No PR cache found at {cache_path}. Commit docs will not have PR text.")
+    # 2. Fetch all PRs referenced in commit messages (uses cache; network only for missing ones)
+    print("\n[2/5] Fetching PR details for all referenced PRs ...")
+    t = time.time()
+    pr_cache = fetch_all_pr_details(
+        commits=commits,
+        owner="psf",
+        repo="requests",
+        cache_path=cache_path,
+    )
+    print(f"      Done in {time.time()-t:.1f}s")
 
-    # 3. Build function histories (track step)
-    print("\n[2/4] Building function histories ...")
+    # 3. Build function histories
+    print("\n[3/5] Building function histories ...")
     t = time.time()
     histories = build_function_histories(str(repo_path), max_commits=300)
     print(f"      {len(histories)} function identities in {time.time()-t:.1f}s")
 
     # 4. Build documents
-    print("\n[3/4] Building index documents ...")
+    print("\n[4/5] Building index documents ...")
     t = time.time()
     commit_docs   = build_commit_documents(commits, pr_cache)
     function_docs = build_function_documents(histories)
@@ -398,44 +490,22 @@ if __name__ == "__main__":
     print(f"      {len(commit_docs)} commit docs + {len(function_docs)} function docs "
           f"= {len(all_docs)} total ({time.time()-t:.1f}s)")
 
-    # 5. Embed + store
-    print(f"\n[4/4] Embedding and indexing into ChromaDB at {chroma_dir} ...")
+    # 5. Embed + store (with change detection)
+    print(f"\n[5/5] Embedding and indexing into ChromaDB at {chroma_dir} ...")
     t = time.time()
     stats = index_documents(all_docs, chroma_dir=chroma_dir)
     embed_time = time.time() - t
-    print(f"      Added {stats['added']} new docs, skipped {stats['skipped']} already-indexed "
-          f"({embed_time:.1f}s)")
+    print(f"      Added {stats['added']} new, {stats['changed']} changed, "
+          f"{stats['skipped']} skipped ({embed_time:.1f}s)")
 
     total_time = time.time() - total_start
     print(f"\n[index] Total time: {total_time:.1f}s")
     print(f"[index] ChromaDB collection size: {_get_collection(chroma_dir).count()} documents")
 
     # 6. Demo search
-    query = "why was _encode_files changed"
-    print(f"\n{'='*72}")
-    print(f"  SEARCH: \"{query}\"")
-    print(f"{'='*72}")
+    _print_results(
+        "why was _encode_files changed",
+        search("why was _encode_files changed", n=5, chroma_dir=chroma_dir),
+    )
 
-    results = search(query, n=5, chroma_dir=chroma_dir)
-    if not results:
-        print("  No results found.")
-    else:
-        for rank, hit in enumerate(results, 1):
-            m = hit["metadata"]
-            print(f"\n  [{rank}] dist={hit['distance']:.4f}  type={m.get('type','?')}")
-            if m.get("type") == "commit":
-                print(f"       {m.get('short_hash','')}  {m.get('date','')[:10]}  {m.get('author','')}")
-                print(f"       {m.get('message','')}")
-                if m.get("changed_files"):
-                    print(f"       Files: {m['changed_files'][:80]}")
-            elif m.get("type") == "function":
-                print(f"       {m.get('identity','')}")
-                print(f"       Changed {m.get('num_commits',0)}x, last by {m.get('last_author','')} on {m.get('last_date','')}")
-                print(f"       {m.get('last_message','')}")
-            # Print first 2 lines of the stored text for context
-            snippet = "\n".join(hit["text"].splitlines()[:2])
-            print(f"       >> {snippet}")
-
-    print(f"\n{'='*72}")
-    print("  Tip: Run again to test incremental indexing (all docs should be skipped).")
-    print(f"{'='*72}\n")
+    print("\n  Tip: Run again to test incremental indexing (all docs should be skipped).")
