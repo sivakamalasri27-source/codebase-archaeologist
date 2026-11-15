@@ -1,11 +1,12 @@
 """Git history extraction and GitHub API integration module.
 
-Week 1 / Week 4 Component of Codebase Archaeologist:
+Codebase Archaeologist:
 - Extracts commit logs, file changes, and Python diffs using PyDriller.
-- Fetches PR descriptions and issue discussions using GitHub REST API.
-- Caches API responses locally in JSON to prevent hitting rate limits.
-- fetch_all_pr_details(): scans commit messages for (#NNN) references,
-  fetches any missing PRs + linked issues from GitHub, updates cache.
+- Fetches PR and Issue details via GitHub REST API (/issues/{number}).
+- Caches API responses locally in JSON to prevent repeated requests.
+- fetch_all_pr_details(): scans commit messages for #number references,
+  fetches any missing items using the unified GitHub /issues/{number} endpoint,
+  labels them as PRs or Issues, and crawls linked issues/PRs.
 """
 
 from __future__ import annotations
@@ -25,9 +26,9 @@ import requests as http_requests
 # Load environment variables from .env file if present
 load_dotenv()
 
-# Regex: match PR references like "(#7502)" or "#7502" in commit messages
+# Regex: match PR / issue references like "(#7502)" or "#7502" in commit messages
 _PR_REF_RE = re.compile(r"\(#(\d+)\)|(?<!\w)#(\d+)")
-# Regex: match issue links in PR bodies like "Fixes #123", "Closes #456"
+# Regex: match issue links in PR/issue bodies like "Fixes #123", "Closes #456"
 _ISSUE_LINK_RE = re.compile(
     r"(?:fixes|closes|resolves|fix|close|resolve)\s+#(\d+)",
     re.IGNORECASE,
@@ -55,15 +56,9 @@ def extract_commits(
         - changed_files (list[str]): List of all modified/added/deleted file paths.
         - python_diffs (list[dict[str, str]]): List of diffs for modified .py files,
           each containing 'path' and 'diff' text.
-
-    Plain English: We walk through every commit in the repo using PyDriller.
-    For each commit we record who made it, when, what message they left, and
-    what Python files changed along with their diff text.
-    We stop at max_commits to keep indexing fast during development.
     """
     extracted_commits: list[dict[str, Any]] = []
 
-    # Traverse commits in repository
     repo = Repository(repo_path, order=order)
     for commit in repo.traverse_commits():
         all_changed_files: list[str] = []
@@ -117,18 +112,7 @@ def fetch_pr_and_issue_text(
     cache_path: str | Path | None = None,
     per_page: int = 15,
 ) -> dict[str, Any]:
-    """Fetch Pull Request descriptions and Issue discussions via GitHub REST API with JSON caching.
-
-    Args:
-        owner: GitHub repository owner (e.g., 'psf').
-        repo: GitHub repository name (e.g., 'requests').
-        token: GitHub Personal Access Token (defaults to GITHUB_TOKEN in .env).
-        cache_path: Filepath for the JSON cache.
-        per_page: Number of items to retrieve per API request (max 100).
-
-    Returns:
-        A dictionary containing repo, pull_requests, and issues lists.
-    """
+    """Fetch initial PR descriptions and Issue discussions via GitHub REST API."""
     resolved_cache = Path(cache_path) if cache_path else Path(f"{owner}_{repo}_github_cache.json")
 
     if resolved_cache.exists():
@@ -142,7 +126,6 @@ def fetch_pr_and_issue_text(
     headers = _build_headers(auth_token)
     base_url = f"https://api.github.com/repos/{owner}/{repo}"
 
-    # 1. Fetch Pull Requests
     pull_requests: list[dict[str, Any]] = []
     try:
         pr_response = http_requests.get(
@@ -159,7 +142,6 @@ def fetch_pr_and_issue_text(
     except http_requests.RequestException as err:
         print(f"[REQUEST ERROR] Failed fetching pull requests: {err}")
 
-    # 2. Fetch Issues (excluding PRs)
     issues: list[dict[str, Any]] = []
     try:
         issue_response = http_requests.get(
@@ -195,91 +177,110 @@ def fetch_all_pr_details(
     cache_path: str | Path,
     token: str | None = None,
 ) -> dict[str, Any]:
-    """Fetch every PR referenced in commit messages, plus any issues they link.
-
-    Args:
-        commits: List of commit dicts from extract_commits().
-        owner: GitHub repo owner, e.g. 'psf'.
-        repo: GitHub repo name, e.g. 'requests'.
-        cache_path: Path to the JSON cache file (created if absent).
-        token: GitHub PAT; falls back to GITHUB_TOKEN env var.
-
-    Returns:
-        Updated pr_cache dict with pull_requests and issues lists.
+    """Fetch every #number referenced in commits via GET /repos/{owner}/{repo}/issues/{number}.
 
     Plain English:
-    1. Scan every commit message for patterns like "(#7502)".
-    2. For each PR number NOT yet in cache, fetch title and body from GitHub.
-       If rate-limited (403/429), sleeps and retries. If unauthenticated limit
-       is exhausted, safely halts remote calls and preserves cache.
-    3. If PR body says "Fixes #123" or "Closes #123", fetch that issue too.
-    4. Automatically writes updated cache to JSON so runs resume seamlessly.
+    GitHub shares one single numbering space between issues and PRs.
+    Calling /pulls/{number} on an issue returns 404. Calling /issues/{number}
+    works for both:
+      - If 'pull_request' is in the payload, it is a PR (is_pr = True).
+      - Otherwise, it is a regular issue (is_pr = False).
+    We read GITHUB_TOKEN from .env, check what is already cached (never refetching
+    existing items), fetch missing ones, and scan bodies for linked 'Fixes #N' items.
     """
     resolved_cache = Path(cache_path)
     auth_token = token or os.getenv("GITHUB_TOKEN")
     headers = _build_headers(auth_token)
-    base_url = f"https://api.github.com/repos/{owner}/{repo}"
 
-    # Load existing cache (or start fresh)
+    # 1. Load existing cache or initialize fresh
     if resolved_cache.exists():
         with open(resolved_cache, encoding="utf-8") as f:
             cache: dict[str, Any] = json.load(f)
     else:
         cache = {"repo": f"{owner}/{repo}", "pull_requests": [], "issues": []}
 
-    cached_pr_nums: set[int] = {pr["number"] for pr in cache.get("pull_requests", []) if pr.get("number")}
-    cached_issue_nums: set[int] = {iss["number"] for iss in cache.get("issues", []) if iss.get("number")}
+    # Ensure existing cache entries have is_pr flag and build fast lookup
+    cached_by_num: dict[int, dict[str, Any]] = {}
+    for pr in cache.setdefault("pull_requests", []):
+        if pr.get("number"):
+            pr.setdefault("is_pr", True)
+            cached_by_num[pr["number"]] = pr
 
-    # Collect PR numbers referenced in commit messages
-    referenced_pr_nums: set[int] = set()
+    for iss in cache.setdefault("issues", []):
+        if iss.get("number"):
+            iss.setdefault("is_pr", False)
+            cached_by_num[iss["number"]] = iss
+
+    # 2. Collect all referenced #numbers from commit messages
+    referenced_nums: set[int] = set()
     for c in commits:
         msg = c.get("message", "") or ""
         for m in _PR_REF_RE.finditer(msg):
             num = int(m.group(1) or m.group(2))
-            referenced_pr_nums.add(num)
+            referenced_nums.add(num)
 
-    missing_prs = sorted(referenced_pr_nums - cached_pr_nums)
-    print(f"[fetch_all_pr_details] {len(referenced_pr_nums)} PR references in commits. "
-          f"{len(cached_pr_nums)} already cached, {len(missing_prs)} to fetch.")
+    missing_nums = sorted(referenced_nums - set(cached_by_num.keys()))
+    print(f"[fetch_all_pr_details] {len(referenced_nums)} references in commits. "
+          f"{len(cached_by_num)} already cached, {len(missing_nums)} to fetch.")
 
-    newly_fetched_prs = 0
-    newly_fetched_issues = 0
+    failed_items: dict[int, tuple[int | None, str]] = {}
+    newly_fetched = 0
 
-    for idx, pr_num in enumerate(missing_prs, 1):
-        pr_data, hit_limit = _github_get(f"{base_url}/pulls/{pr_num}", headers)
-        if hit_limit:
-            print(f"[fetch_all_pr_details] Rate limit reached. Stopping further fetches.")
-            break
-        if pr_data is None:
-            continue
+    # Helper to fetch and cache a single issue/PR number
+    def _fetch_and_cache(num: int) -> dict[str, Any] | None:
+        nonlocal newly_fetched
+        if num in cached_by_num:
+            return cached_by_num[num]
 
-        normalised = _normalise_pr(pr_data)
-        cache.setdefault("pull_requests", []).append(normalised)
-        cached_pr_nums.add(pr_num)
-        newly_fetched_prs += 1
-        print(f"  [{idx}/{len(missing_prs)}] PR #{pr_num}: {normalised['title'][:60]}")
+        data, status_code, err_msg = _github_fetch_issue(owner, repo, num, headers)
+        if data is None:
+            failed_items[num] = (status_code, err_msg or "Unknown error")
+            print(f"  [FAILURE] #{num}: HTTP {status_code} - {err_msg}")
+            return None
 
-        # Scan for linked issues
-        body = normalised.get("body", "") or ""
-        for issue_match in _ISSUE_LINK_RE.finditer(body):
-            issue_num = int(issue_match.group(1))
-            if issue_num in cached_issue_nums:
-                continue
-            issue_data, hit_limit_iss = _github_get(f"{base_url}/issues/{issue_num}", headers)
-            if hit_limit_iss:
-                break
-            if issue_data and "pull_request" not in issue_data:
-                cache.setdefault("issues", []).append(_normalise_issue(issue_data))
-                cached_issue_nums.add(issue_num)
-                newly_fetched_issues += 1
-                print(f"    -> Linked Issue #{issue_num}: {issue_data.get('title','')[:50]}")
+        is_pr = "pull_request" in data
+        item_record: dict[str, Any] = {
+            "number": data.get("number", num),
+            "title": data.get("title", ""),
+            "body": data.get("body") or "",
+            "author": (data.get("user") or {}).get("login", ""),
+            "state": data.get("state", ""),
+            "html_url": data.get("html_url", ""),
+            "is_pr": is_pr,
+            "created_at": data.get("created_at", ""),
+        }
 
-        # Persist after each PR so progress is never lost
+        if is_pr:
+            cache["pull_requests"].append(item_record)
+        else:
+            cache["issues"].append(item_record)
+
+        cached_by_num[num] = item_record
+        newly_fetched += 1
+        tag = "PR" if is_pr else "Issue"
+        print(f"  [FETCHED] {tag} #{num}: {item_record['title'][:60]}")
+
+        # Scan for linked issues in body (e.g. Fixes #123, Closes #456)
+        body = item_record.get("body", "") or ""
+        for linked_match in _ISSUE_LINK_RE.finditer(body):
+            linked_num = int(linked_match.group(1))
+            if linked_num not in cached_by_num:
+                print(f"    -> Following linked item #{linked_num} from #{num}...")
+                _fetch_and_cache(linked_num)
+
         _save_cache(resolved_cache, cache)
+        return item_record
 
-    print(f"[fetch_all_pr_details] Done. Fetched {newly_fetched_prs} new PRs and "
-          f"{newly_fetched_issues} new issues. Cache now has "
-          f"{len(cache['pull_requests'])} PRs and {len(cache['issues'])} issues.")
+    # 3. Fetch each missing referenced number
+    for num in missing_nums:
+        _fetch_and_cache(num)
+
+    # Attach tracking metrics to cache object
+    cache["_referenced_nums"] = referenced_nums
+    cache["_failed_items"] = failed_items
+
+    print(f"[fetch_all_pr_details] Complete. Newly fetched: {newly_fetched}. "
+          f"Cache now has {len(cache['pull_requests'])} PRs and {len(cache['issues'])} Issues.")
 
     return cache
 
@@ -301,53 +302,47 @@ def _build_headers(auth_token: str | None) -> dict[str, str]:
     return headers
 
 
-def _github_get(
-    url: str,
+def _github_fetch_issue(
+    owner: str,
+    repo: str,
+    number: int,
     headers: dict[str, str],
     max_retries: int = 3,
-) -> tuple[dict[str, Any] | None, bool]:
-    """GET a single GitHub API URL with exponential back-off on 403/429.
+) -> tuple[dict[str, Any] | None, int | None, str | None]:
+    """Fetch GET /repos/{owner}/{repo}/issues/{number} handling 403/429 retries.
 
     Returns:
-        tuple (data_dict_or_None, rate_limit_hit_bool)
+        tuple of (data_dict_or_None, status_code_or_None, error_msg_or_None)
     """
+    url = f"https://api.github.com/repos/{owner}/{repo}/issues/{number}"
     delay = 5
+
     for attempt in range(1, max_retries + 1):
         try:
             resp = http_requests.get(url, headers=headers, timeout=15)
         except http_requests.RequestException as err:
-            print(f"  [HTTP ERROR] {url}: {err}")
-            return None, False
+            return None, None, str(err)
 
         if resp.status_code == 200:
-            return resp.json(), False
+            return resp.json(), 200, None
 
         if resp.status_code in (403, 429):
-            rem = resp.headers.get("x-ratelimit-remaining")
-            reset = resp.headers.get("x-ratelimit-reset")
             retry_after = resp.headers.get("Retry-After")
-
-            if rem == "0" and reset:
-                now = time.time()
-                wait_sec = max(0, int(reset) - int(now)) + 1
-                if wait_sec > 120 and "Authorization" not in headers:
-                    print(f"  [RATE LIMIT] Unauthenticated GitHub rate limit exhausted (resets in {wait_sec}s).")
-                    print("  [TIP] Provide a GITHUB_TOKEN in .env to enable 5,000 requests/hr.")
-                    return None, True
-
             wait = int(retry_after) if retry_after and retry_after.isdigit() else delay
-            print(f"  [RATE LIMIT] {resp.status_code} on {url}. Waiting {wait}s (retry {attempt}/{max_retries}) ...")
+            print(f"  [RATE LIMIT] #{number} returned {resp.status_code}. "
+                  f"Waiting {wait}s (retry {attempt}/{max_retries}) ...")
             time.sleep(wait)
             delay = min(delay * 2, 60)
             continue
 
-        if resp.status_code == 404:
-            return None, False
+        # Any non-rate-limit failure (e.g. 404, 401, 500)
+        try:
+            err_msg = resp.json().get("message", resp.text[:200])
+        except Exception:
+            err_msg = resp.reason or resp.text[:200]
+        return None, resp.status_code, err_msg
 
-        print(f"  [API ERROR] {resp.status_code} for {url}: {resp.text[:200]}")
-        return None, False
-
-    return None, True
+    return None, 429, "Max rate limit retries exceeded"
 
 
 def _normalise_pr(pr: dict[str, Any]) -> dict[str, Any]:
@@ -361,6 +356,7 @@ def _normalise_pr(pr: dict[str, Any]) -> dict[str, Any]:
         "created_at": pr.get("created_at", ""),
         "merged_at": pr.get("merged_at"),
         "html_url": pr.get("html_url", ""),
+        "is_pr": True,
     }
 
 
@@ -375,14 +371,16 @@ def _normalise_issue(item: dict[str, Any]) -> dict[str, Any]:
         "comments_count": item.get("comments", 0),
         "created_at": item.get("created_at", ""),
         "html_url": item.get("html_url", ""),
+        "is_pr": False,
     }
 
 
 def _save_cache(cache_path: Path, data: dict[str, Any]) -> None:
-    """Write cache data to disk as UTF-8 JSON."""
+    """Write cache data to disk as UTF-8 JSON (excluding private keys)."""
     try:
+        clean_data = {k: v for k, v in data.items() if not k.startswith("_")}
         with open(cache_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(clean_data, f, indent=2, ensure_ascii=False)
     except OSError as err:
         print(f"[CACHE WRITE ERROR] {err}")
 
@@ -403,7 +401,7 @@ def _ensure_sample_repo(target_dir: Path) -> Path:
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("Codebase Archaeologist - Git Extraction Demo (Week 1 / Week 4)")
+    print("Codebase Archaeologist - Git Extraction Demo")
     print("=" * 70)
 
     project_root = Path(__file__).resolve().parent.parent
@@ -426,7 +424,7 @@ if __name__ == "__main__":
         print(f"     Msg: {first_line_msg}")
         print(f"     Changed files ({len(c['changed_files'])}): {', '.join(c['changed_files'][:4])}")
 
-    print("\nTesting GitHub PR & Issue retrieval with local cache...")
+    print("\nTesting GitHub PR & Issue retrieval with unified /issues endpoint...")
     demo_cache_path = project_root / "cache_github_requests.json"
     data = fetch_all_pr_details(commits, "psf", "requests", cache_path=demo_cache_path)
     print("=" * 70)
