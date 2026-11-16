@@ -465,29 +465,34 @@ def _extract_pr_context(doc_text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main Entry Point
+# ask_detailed: Structured dict result (ask() wraps this)
 # ---------------------------------------------------------------------------
 
-def ask(
+def ask_detailed(
     question: str,
     chroma_dir: str | Path = CHROMA_DIR,
     top_k: int = TOP_K_COMBINED,
     force_structured: bool = False,
-    verbose: bool = True,
-) -> str:
-    """Answer a natural-language question about code changes with citation verification.
+    verbose: bool = False,
+) -> dict[str, Any]:
+    """Answer a question and return a structured dict with all metadata.
 
     Plain English:
-    1. Retrieves relevant commits and functions from ChromaDB.
-    2. Prints the top-3 distances for user calibration.
-    3. Abstains if the best hit is farther than ABSTAIN_DISTANCE (0.70).
-    4. Calls Gemini as the main path using the official google-genai SDK.
-    5. Falls back to structured synthesis if Gemini fails, printing the reason.
-    6. Ensures the answer is non-empty and substantive.
-    7. Classifies citations into 3 levels (in evidence, exists in repo, not found).
-       Only 'not found' counts as hallucination.
-       For fallback, prints: 'Citation check: n/a (fallback builds citations from retrieved hits)'.
-    8. Measures execution time and prints a breakdown if total time > 20s.
+    Does exactly what ask() does internally, but instead of printing everything
+    and returning only the answer string, it returns a dict with every piece
+    of data the benchmark needs: answer text, model used, citation counts,
+    top-3 retrieval distances, abstain flag, and elapsed time.
+
+    Keys returned:
+        answer              - full answer string
+        model_used          - "gemini", "structured", or "abstained"
+        cited_hashes        - deduplicated hashes cited in the answer (LLM only)
+        in_evidence         - count of hashes in the retrieved hits
+        exists_in_repo      - count of hashes in ChromaDB but not in hits
+        not_found           - count of hashes not in repo at all (hallucinations)
+        top3_distances      - list of up to 3 retrieval distances
+        abstained_at_retrieval - True if answer was skipped due to distance
+        seconds             - total elapsed time
     """
     t_start = time.time()
     t_model_load = 0.0
@@ -497,7 +502,7 @@ def ask(
     if verbose:
         print(f"\n[qa] Question: \"{question}\"")
 
-    # Step 0: Ensure embedding model is loaded and track load time if first call
+    # Step 0: Ensure embedding model is loaded
     from index import _model, _load_model
     if _model is None:
         t_ml_start = time.time()
@@ -509,21 +514,45 @@ def ask(
     hits = retrieve(question, chroma_dir=chroma_dir, top_k=top_k)
     t_retrieval = time.time() - t_ret_start
 
+    top3_distances = [round(h["distance"], 4) for h in hits[:3]]
+
+    if verbose:
+        print(f"[qa] Top-3 distances: {top3_distances}")
+
+    # Empty hits → abstain
     if not hits:
-        print("[qa] Top-3 distances: []")
-        return "Not enough evidence in the repo history"
+        elapsed = time.time() - t_start
+        return {
+            "answer": "Not enough evidence in the repo history",
+            "model_used": "abstained",
+            "cited_hashes": [],
+            "in_evidence": 0,
+            "exists_in_repo": 0,
+            "not_found": 0,
+            "top3_distances": [],
+            "abstained_at_retrieval": True,
+            "seconds": round(elapsed, 2),
+        }
 
-    # Step 2: Print top-3 distances for calibration
-    top_3_dists = [round(h["distance"], 4) for h in hits[:3]]
-    print(f"[qa] Top-3 distances: {top_3_dists}")
-
-    # Step 3: Abstain check
+    # Step 2: Distance-based abstain check
     best_dist = hits[0]["distance"]
     if best_dist > ABSTAIN_DISTANCE:
-        print(f"[qa] Best distance {best_dist:.4f} > ABSTAIN_DISTANCE ({ABSTAIN_DISTANCE:.2f}). Abstaining.")
-        return "Not enough evidence in the repo history"
+        if verbose:
+            print(f"[qa] Best distance {best_dist:.4f} > ABSTAIN_DISTANCE ({ABSTAIN_DISTANCE:.2f}). Abstaining.")
+        elapsed = time.time() - t_start
+        return {
+            "answer": "Not enough evidence in the repo history",
+            "model_used": "abstained",
+            "cited_hashes": [],
+            "in_evidence": 0,
+            "exists_in_repo": 0,
+            "not_found": 0,
+            "top3_distances": top3_distances,
+            "abstained_at_retrieval": True,
+            "seconds": round(elapsed, 2),
+        }
 
-    # Step 4: Build context and attempt Gemini answer
+    # Step 3: Build context and attempt Gemini
     context = _build_context(hits)
     answer: str | None = None
     backend_used = "structured"
@@ -535,48 +564,195 @@ def ask(
         if answer is not None:
             backend_used = "gemini"
         else:
-            print(f"[qa] LLM not used: {failure_reason}")
+            if verbose:
+                print(f"[qa] LLM not used: {failure_reason}")
 
-    # Step 5: Fallback to structured if Gemini not used
+    # Step 4: Fallback to structured synthesis
     if answer is None:
         answer = _synthesise_structured(question, hits)
         backend_used = "structured"
 
-    # Step 6: Ensure answer is never cut off or empty
-    cleaned_answer = answer.strip() if answer else ""
-    if not cleaned_answer or len(cleaned_answer.split()) <= 1:
-        print(f"[qa] [ERROR] Answer text is empty or incomplete for question: \"{question}\"")
-        answer = f"[ERROR: Answer generation produced an empty or cut off response for query: {question}]"
+    # Step 5: Ensure answer is non-empty
+    cleaned = answer.strip() if answer else ""
+    if not cleaned or len(cleaned.split()) <= 1:
+        answer = f"[ERROR: Answer generation produced an empty or cut-off response for query: {question}]"
     else:
-        answer = cleaned_answer
+        answer = cleaned
 
-    # Step 7: Three-level citation classification ONLY for LLM answers
+    # Step 6: Citation classification (LLM only)
+    cited_hashes: list[str] = []
+    in_ev: list[str] = []
+    in_repo: list[str] = []
+    not_fnd: list[str] = []
+
     if backend_used == "gemini":
         in_ev, in_repo, not_fnd = validate_citations(answer, hits, chroma_dir=chroma_dir)
-        cites_summary = (
-            f"{len(in_ev)} in evidence, "
-            f"{len(in_repo)} exists in repo ({', '.join(in_repo) if in_repo else 'none'}), "
-            f"{len(not_fnd)} not found ({', '.join(not_fnd) if not_fnd else 'none'})"
-        )
-        print(f"[qa] Citations (LLM, 3-level): {cites_summary}")
-        # Only c) 'not found' counts as hallucination
-        if not_fnd:
-            print(f"[qa] [WARNING] Hallucinated citations detected (not in index): {not_fnd}")
-    else:
+        cited_hashes = in_ev + in_repo + not_fnd
+        if verbose:
+            print(
+                f"[qa] Citations (LLM, 3-level): "
+                f"{len(in_ev)} in evidence, "
+                f"{len(in_repo)} exists in repo ({', '.join(in_repo) or 'none'}), "
+                f"{len(not_fnd)} not found ({', '.join(not_fnd) or 'none'})"
+            )
+    elif verbose:
         print("[qa] Citation check: n/a (fallback builds citations from retrieved hits)")
 
-    # Step 8: Execution timing and slow query breakdown (>20s)
     elapsed = time.time() - t_start
-    print(f"[qa] Time taken: {elapsed:.2f}s (via {backend_used})")
-    if elapsed > 20.0:
-        print(
-            f"[qa] [SLOW QUERY > 20s] Timing breakdown: "
-            f"embedding model load={t_model_load:.2f}s, "
-            f"retrieval={t_retrieval:.2f}s, "
-            f"Gemini call={t_gemini:.2f}s"
-        )
+    if verbose:
+        print(f"[qa] Time taken: {elapsed:.2f}s (via {backend_used})")
+        if elapsed > 20.0:
+            print(
+                f"[qa] [SLOW QUERY >20s] embedding model load={t_model_load:.2f}s, "
+                f"retrieval={t_retrieval:.2f}s, Gemini call={t_gemini:.2f}s"
+            )
 
-    return answer
+    return {
+        "answer": answer,
+        "model_used": backend_used,
+        "cited_hashes": cited_hashes,
+        "in_evidence": len(in_ev),
+        "exists_in_repo": len(in_repo),
+        "not_found": len(not_fnd),
+        "top3_distances": top3_distances,
+        "abstained_at_retrieval": False,
+        "seconds": round(elapsed, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# plain_gemini: Answer with no retrieval (baseline comparison)
+# ---------------------------------------------------------------------------
+
+def plain_gemini(
+    question: str,
+    chroma_dir: str | Path = CHROMA_DIR,
+) -> dict[str, Any]:
+    """Call Gemini with no retrieval context (plain baseline).
+
+    Plain English:
+    Sends the question directly to Gemini with no evidence blocks — just a
+    simple prompt. This is the "naive LLM" baseline for the benchmark.
+    We then check whether any commit hashes it cites actually exist in
+    ChromaDB (exist_in_repo) or are made up (hashes_missing).
+
+    Keys returned:
+        answer              - Gemini's raw answer (or error string)
+        cited_hashes        - deduplicated hashes extracted from the answer
+        hashes_exist_in_repo - hashes that exist in the ChromaDB index
+        hashes_missing      - hashes not in the index (likely hallucinated)
+        seconds             - elapsed time
+        error               - None on success, error string on failure
+    """
+    t_start = time.time()
+
+    raw_key = os.getenv("GEMINI_API_KEY", "")
+    api_key = raw_key.strip("<> '\"") if raw_key else ""
+
+    if not api_key:
+        return {
+            "answer": "",
+            "cited_hashes": [],
+            "hashes_exist_in_repo": [],
+            "hashes_missing": [],
+            "seconds": 0.0,
+            "error": "GEMINI_API_KEY not found or empty in .env",
+        }
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return {
+            "answer": "",
+            "cited_hashes": [],
+            "hashes_exist_in_repo": [],
+            "hashes_missing": [],
+            "seconds": 0.0,
+            "error": "google-genai SDK not installed",
+        }
+
+    prompt = f"Answer this question about the psf/requests GitHub repository: {question}"
+    error_str: str | None = None
+    answer = ""
+
+    try:
+        client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=25000),
+        )
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        answer = (response.text or "").strip()
+        if not answer:
+            error_str = "Gemini returned an empty response"
+    except Exception as exc:
+        error_str = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+    # Extract and classify hashes from answer
+    repo_hashes = _get_repo_commit_hashes(chroma_dir)
+    cited_raw = _CITATION_RE.findall(answer)
+    # Also scan for bare 7–40 char hex strings outside brackets
+    bare_hex = re.findall(r"\b([0-9a-fA-F]{7,40})\b", answer)
+    all_raw = cited_raw + bare_hex
+    # Deduplicate
+    unique_cited = list(dict.fromkeys(c.strip().lower() for c in all_raw))
+
+    hashes_exist: list[str] = []
+    hashes_missing: list[str] = []
+
+    for h in unique_cited:
+        if (
+            h in repo_hashes
+            or any(rh.startswith(h) for rh in repo_hashes)
+            or any(h.startswith(rh) for rh in repo_hashes)
+        ):
+            hashes_exist.append(h)
+        else:
+            hashes_missing.append(h)
+
+    elapsed = time.time() - t_start
+
+    return {
+        "answer": answer,
+        "cited_hashes": unique_cited,
+        "hashes_exist_in_repo": hashes_exist,
+        "hashes_missing": hashes_missing,
+        "seconds": round(elapsed, 2),
+        "error": error_str,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main Entry Point
+# ---------------------------------------------------------------------------
+
+def ask(
+    question: str,
+    chroma_dir: str | Path = CHROMA_DIR,
+    top_k: int = TOP_K_COMBINED,
+    force_structured: bool = False,
+    verbose: bool = True,
+) -> str:
+    """Thin wrapper around ask_detailed() that returns only the answer string.
+
+    Plain English:
+    Calls ask_detailed() to do all the work (retrieval, abstain check, Gemini,
+    fallback, citation validation, timing), prints the same log lines to stdout
+    when verbose=True, and returns just the answer text.
+    All callers keep working without any changes.
+    """
+    result = ask_detailed(
+        question,
+        chroma_dir=chroma_dir,
+        top_k=top_k,
+        force_structured=force_structured,
+        verbose=verbose,
+    )
+    return result["answer"]
+
 
 
 # ---------------------------------------------------------------------------

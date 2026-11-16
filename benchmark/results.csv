@@ -1,0 +1,196 @@
+﻿question,source_url,is_abstain_test,tool_answer,tool_hashes,tool_in_evidence,tool_exists_in_repo,tool_not_found,top3_distances,abstained_at_retrieval,tool_seconds,plain_answer,plain_hashes,plain_hashes_exist,plain_hashes_missing,tool_correct,tool_gave_why,plain_correct
+Why did Requests change the regex it uses to check whether a header value is valid?,https://github.com/psf/requests/pull/7308,FALSE,"Requests updated its header validity parsing regex in PR #7308 after a security channel report by @ParzivalHack [bc7dd0fc]. The regex originally protected older Python versions before the standard library handled line folding in `http.client`, but now functions as a cosmetic guard and cleaner error layer for callers of Requests [bc7dd0fc].
+
+Specifically, the end of the regex was modified from `$` to `\Z` in order to capture any end-of-line LF (line feed) characters [bc7dd0fc]. Those LF characters were previously ignored by `$` for convenience and were missed by existing tests [bc7dd0fc]. The change was made to ensure that Requests raises its validation error uniformly rather than letting standard library error messages sneak through [bc7dd0fc].",bc7dd0fc,1,0,0,0.3371|0.4664|0.4961,FALSE,32.23,"The `psf/requests` repository updated its regular expression (and overall validation approach) for HTTP header values primarily for three main reasons: **security (preventing CRLF injection)**, **avoiding ReDoS (Regular Expression Denial of Service)**, and **aligning with RFC standards (RFC 7230 / RFC 9110)**.
+
+Here is a detailed breakdown of why the change was made:
+
+---
+
+### 1. Security: Preventing HTTP Header (CRLF) Injection
+* **The Problem:** If an attacker can inject carriage return (`\r`) or linefeed (`\n`) characters into a header value, they can break out of the header section and inject arbitrary HTTP headers or even an entirely new HTTP response body (HTTP Response Splitting / Request Smuggling).
+* **The Fix:** The regex was updated to strictly disallow control characters—specifically `\r` and `\n`—unless they are part of a valid folded header (though header folding itself has been deprecated in modern HTTP specs).
+
+---
+
+### 2. Preventing ReDoS (Catastrophic Backtracking)
+* **The Problem:** Earlier regex patterns used by Requests (and underlying libraries like `urllib3`) contained permissive or nested quantifiers (such as matching arbitrary whitespace or control characters). When processing long or specially crafted header values, these regex patterns suffered from **catastrophic backtracking**. 
+* **The Impact:** An attacker sending a long header value could spike the CPU to 100%, causing a Denial of Service (DoS) for the application.
+* **The Fix:** The regex was refactored into a simpler, linear-time pattern (or replaced in parts with direct character/byte checks) to ensure validation executes in $O(N)$ time.
+
+---
+
+### 3. RFC Compliance (RFC 7230 / RFC 9110)
+* **The Problem:** Older validation logic was either too strict (blocking valid non-ASCII `latin-1` / `obs-text` characters allowed by HTTP standards) or too permissive (allowing invalid ASCII control characters like `\x00` or `\x07`).
+* **The Fix:** The updated regex strictly enforces HTTP specifications:
+  * **Allowed:** Printable ASCII characters (`\x20-\x7E`), tab (`\t`), and `obs-text` (bytes `\x80-\xFF` / ISO-8859-1).
+  * **Forbidden:** Control characters (`\x00-\x1F`, `\x7F`), specifically `\r` and `\n`, unless properly handled as optional whitespace (OWS).
+
+---
+
+### Summary
+Requests changed its header validation regex to **close security vulnerabilities (CRLF injection and ReDoS performance bugs)** while ensuring strict adherence to **HTTP specification standards (RFC 7230/9110)**.",,,,Yes,Yes,No
+Why were the type hints for request headers changed to deal with mutability?,https://github.com/psf/requests/pull/7431,FALSE,"The type hints for request headers were initially changed in PR #7431 to address mutability issues because the lack of header mutability in the typing contract was creating friction for some codebases [e511bc72]. Maintainers noted that header mutability had originally been planned but was lost during earlier cleanup [e511bc72].
+
+However, `Request.headers` was later moved back from `MutableMapping` to `Mapping` in PR #7441 [84d10f0b]. This partial revert occurred because dictionaries inferred as `dict[str, str]` at creation proved incompatible with `MutableMapping[str, str | bytes]` [84d10f0b]. The maintainers determined that forcing all users to type their header inputs as `dict[str, str | bytes]` was significantly more invasive for existing codebases than sacrificing support for `update()` calls on `Request.headers` [84d10f0b].",e511bc72|84d10f0b,2,0,0,0.4573|0.4754|0.4825,FALSE,5.85,"The type hints for request headers in `requests` (and related typing definitions like `typeshed`) were changed to use read-only mapping interfaces (like `Mapping`) rather than mutable ones (like `MutableMapping` or `dict`) primarily for two reasons:
+
+### 1. Fixing Invariance Issues with `Union` Types (Invariance vs. Covariance)
+Request headers in `requests` can accept both `str` and `bytes` for keys and values (e.g., `Union[str, bytes]`). 
+
+* **`MutableMapping` is invariant:** Because a `MutableMapping` allows modification (such as adding key-value pairs via `__setitem__`), type checkers like `mypy` must enforce strict type equality. A type checker will reject passing a `dict[str, str]` into a function expecting `MutableMapping[Union[str, bytes], Union[str, bytes]]` because writing a `bytes` key/value into that dictionary would violate the caller's `dict[str, str]` type contract.
+* **`Mapping` is covariant:** Read-only interfaces like `Mapping` do not allow mutation. Because the function promises not to write to the dictionary, type checkers allow a narrower type (like `Mapping[str, str]`) to be safely passed to a parameter expecting a broader type (like `Mapping[Union[str, bytes], Union[str, bytes]]`).
+
+### 2. Accurately Reflecting API Behavior
+* `requests` does not mutate the headers dictionary passed in by the caller. Instead, it creates an internal copy (a `CaseInsensitiveDict`).
+* Annotating parameters with `Mapping` (an immutable interface) accurately reflects that the function only reads the input headers. This also allows callers to pass immutable mapping types (such as `types.MappingProxyType` or custom read-only dictionaries) without triggering type errors.",,,,Yes,Yes,Partial
+Why did Requests stop setting a default value for malformed Content-Type parameters?,https://github.com/psf/requests/pull/7309,FALSE,"Requests stopped setting a default value for malformed Content-Type parameters because the default value previously assigned could not actually be used in practice [f0198e6d]. This change was introduced in PR #7309 to clean up `_parse_content_type_header` and fix malformed Content-Type header parsing [f0198e6d].
+
+Additionally, standard specifications across every RFC from 1521 to 9110 clearly state that an `=` character is required for a parameter to be valid [f0198e6d]. If an `=` is not present, the parameter is malformed, so Requests now skips value assignment completely and ignores the parameter [f0198e6d].",f0198e6d,1,0,0,0.3227|0.4465|0.5368,FALSE,6.14,"In the `psf/requests` repository, Requests stopped assigning default values to malformed `Content-Type` parameters primarily due to **correctness, security, and standard compliance** when handling HTTP headers.
+
+Here are the specific reasons for this change:
+
+### 1. **Avoiding False Encodings and Incorrect Fallbacks**
+When a `Content-Type` header contained a malformed parameter (such as `text/html; charset=` without a value), legacy parsers like Python's `cgi.parse_header` would assign default empty values (`''`) or fallback defaults to the missing key. 
+
+In Requests, this resulted in `response.encoding` being set to an invalid or empty value rather than triggering the proper fallback mechanism (such as detecting character encoding from the raw content or using standard HTTP defaults).
+
+### 2. **Deprecation and Flaws of Python’s `cgi.parse_header`**
+Requests historically relied on standard library functions like `cgi.parse_header`. However:
+* `cgi` was deprecated in Python 3.11 and removed in Python 3.13.
+* `cgi.parse_header` had non-standard and overly permissive parsing quirks, such as inserting default values for keyless or malformed parameter tokens.
+
+When Requests replaced/updated its internal header parsing logic, it dropped these lenient default assignments to ensure cleaner, more predictable behavior.
+
+### 3. **Strict HTTP Specification Compliance (RFC 7231)**
+HTTP/1.1 (RFC 7231) and MIME specifications require header parameters to follow a strict `key=value` format. Guessing or inventing default values for malformed parameters violates specification boundaries and can cause subtle bugs when communicating with strict servers or downstream parsers.
+
+### 4. **Preventing Security and Interoperability Issues**
+Silently ""fixing"" invalid header parameters by inserting default values can obscure invalid input and create security vulnerabilities (such as unexpected encoding resolution leading to XSS or response splitting vulnerabilities). By ignoring or failing gracefully on malformed parameters rather than injecting default values, Requests avoids unintended side effects during header parsing.",,,,Yes,Yes,Partial
+Why did Requests ignore netrc entries that have no username or password?,https://github.com/psf/requests/pull/7205,FALSE,"Prior to Python 3.11, a `.netrc` entry without a username, account, or password was treated as malformed by Python and raised a `NetrcParseError`, which disabled its usage [47914226]. Beginning in Python 3.11+, Python instead returned an empty tuple `('', '', '')` for these entries [47914226]. This change caused Requests to start sending an empty entry (`:`) for the value encoded in the `Authorization` header [47914226].
+
+Requests updated its handling in PR #7205 to ignore these entries to bring the library back to its intended behavior [47914226]. The maintainers clarified that Requests never intended to support using empty `.netrc` profiles [47914226]. Users who still need to send empty credentials can explicitly pass `auth=('', '')` with their request [47914226].",47914226,1,0,0,0.2833|0.4135|0.4419,FALSE,5.44,"In the `psf/requests` repository, Requests ignores `.netrc` entries that do not contain a username or password primarily because **incomplete entries cannot be used to build valid HTTP authentication headers**. 
+
+Here is a detailed breakdown of why this choice was made:
+
+### 1. HTTP Basic Authentication Requirements
+Requests uses `.netrc` entries to automatically populate HTTP authentication (typically HTTP Basic Auth). HTTP Basic Auth requires a `(username, password)` pair to construct the `Authorization` header:
+
+$$\text{Authorization: Basic } \text{base64(username:password)}$$
+
+If a `.netrc` entry has a `machine` definition but is missing a username (`login`) or password, Python's standard `netrc` module returns `None` for those missing fields. Requests cannot safely map `None` into an HTTP header string.
+
+### 2. Preventing Malformed or Broken Requests
+If Requests did *not* ignore entries with missing usernames or passwords, it would have to make an assumption—such as replacing `None` with an empty string `""""` or sending `None:None`. 
+
+Doing so would cause significant issues:
+* **Malformed Headers:** Sending `None` would cause header formatting errors or result in invalid base64 payloads like `base64(""None:None"")`.
+* **Unintended Authorization Failures:** Sending an empty/invalid `Authorization` header to a server causes the server to reject the request (returning a `401 Unauthorized` or `400 Bad Request`), even if the endpoint allowed unauthenticated access. 
+
+By ignoring incomplete `.netrc` entries, Requests allows the request to proceed anonymously (or fall back to other authentication mechanisms provided explicitly in the code).
+
+### 3. Non-HTTP `.netrc` Usage
+The `.netrc` file format was originally created for command-line tools like standard Unix `ftp` and `rcp`. Users frequently put entries in `~/.netrc` that contain macros, default accounts, or hostnames meant for non-HTTP services. 
+
+Because non-HTTP tools might use `.netrc` differently, Requests ignores entries that don't provide a complete `(username, password)` pair suitable for HTTP requests.
+
+---
+
+### Code Context (in `requests.utils`)
+In Requests' implementation of `get_netrc_auth()`, the logic checks the tuple returned by `netrc.authenticators(host)`:
+
+```python
+# Simplified representation of the check
+login, account, password = auth_info
+
+# If there is no login or no password, the entry is unusable for HTTP auth
+if not login or not password:
+    return None
+```
+
+If either `login` or `password` is missing, `get_netrc_auth` returns `None`, instructing Requests to skip adding automatic credentials for that request.",,,,Yes,Yes,No
+Why did the Windows proxy bypass check return true for every URL in some cases?,https://github.com/psf/requests/pull/6302,FALSE,"The Windows proxy bypass check (`proxy_bypass_registry`) returned true for every URL in certain cases due to handling involving empty strings in the context code [8dd3b26b]. Pull request #6302 noted that the implementation needed to avoid this situation when dealing with empty strings [8dd3b26b].
+
+To resolve this issue, commit 1604e20f fixed the `proxy_bypass_registry` function in `src/requests/utils.py` [1604e20f]. Pull request #6302 merged the fix to ensure empty strings would no longer cause the function to return true [8dd3b26b].
+
+Additionally, test coverage was added in commit 13d892bd to test `should_bypass_proxies` and the Windows registry `ProxyOverride` value behavior [13d892bd].",8dd3b26b|1604e20f|13d892bd,3,0,0,0.4292|0.4815|0.5,FALSE,7.79,"In the `psf/requests` repository (and the underlying standard library `urllib` Windows proxy logic it relied on), the Windows proxy bypass check returned `True` for every URL due to how the Windows registry's **`ProxyOverride`** setting was parsed.
+
+### The Cause: Trailing Semicolons in `ProxyOverride`
+
+1. **Windows Registry Setting:**
+   On Windows, proxy bypass rules are stored in the registry under `ProxyOverride` (in Internet Options). A typical `ProxyOverride` string looks like this:
+   ```text
+   192.168.1.*;<local>;
+   ```
+   Notice the **trailing semicolon (`;`)** at the end of the list, which Windows frequently adds automatically.
+
+2. **Parsing Logic Failure:**
+   When reading this setting, the code split the string by the semicolon delimiter (`.split(';')`) to get individual bypass patterns. 
+   
+   Because of the trailing semicolon, the resulting list of patterns included an **empty string (`""""`)**:
+   ```python
+   [""192.168.1.*"", ""<local>"", """"]
+   ```
+
+3. **Pattern Matching:**
+   When checking if a given URL host matched any of the bypass patterns, the evaluation logic checked if the host matched any string in the list (or if `host.endswith(pattern)` was true). 
+
+   Since **every string ends with an empty string (`""""`)**, the match succeeded for every single hostname tested.
+
+### Result
+Because every hostname matched the empty pattern, `should_bypass_proxies()` returned `True` for all URLs, causing `requests` to completely ignore the configured proxy and attempt direct connections for every request.
+
+### The Fix
+The issue was fixed by stripping whitespace and filtering out empty strings when splitting the `ProxyOverride` registry value before executing the bypass matching logic.",,,,Yes,Partial,Yes
+Why did Requests add built-in GraphQL support?,,TRUE,The evidence does not explain why this change was made.,,0,0,0,0.6339|0.6425|0.646,FALSE,3.36,"Actually, **Requests (`psf/requests`) does not have built-in GraphQL support.** 
+
+The premise of the question is incorrect. The `requests` library is designed to be a standard, general-purpose HTTP client for Python, and its maintainers strictly limit scope creep to keep the core library stable, lightweight, and focused purely on HTTP specifications rather than specific application-layer protocols or schemas.
+
+### How GraphQL is handled with Requests
+Because GraphQL operates over standard HTTP (typically via `POST` requests with a JSON body), you do not need built-in support from `requests` to interact with a GraphQL API. You simply pass the GraphQL `query` and optional `variables` inside the standard `json` parameter:
+
+```python
+import requests
+
+url = ""https://api.example.com/graphql""
+query = """"""
+{
+  user(id: ""123"") {
+    name
+    email
+  }
+}
+""""""
+
+response = requests.post(url, json={""query"": query})
+data = response.json()
+```
+
+### Dedicated Alternatives
+If you need higher-level GraphQL features (such as schema validation, query building, or subscriptions via WebSockets), third-party libraries built on top of or alongside `requests` are recommended:
+* **`gql`**: A comprehensive GraphQL client for Python.
+* **`python-graphql-client`**: A lightweight wrapper for GraphQL queries and mutations.",,,,Yes,n/a,Yes
+Why did Requests move its HTTP engine from urllib3 to httpx?,,TRUE,The evidence does not explain why this change was made.,,0,0,0,0.5409|0.5517|0.5534,FALSE,45.09,"Actually, **Requests has not moved its HTTP engine to `httpx`**. 
+
+The premise of the question contains a common misconception. The `psf/requests` repository **still uses `urllib3`** as its underlying HTTP engine and continues to do so today.
+
+Here is the context behind why this confusion often arises and how `httpx` relates to `requests`:
+
+### 1. `httpx` is a separate library, not an upgrade to Requests
+`httpx` was created by Tom Christie (creator of Django REST Framework) and the Encode team as an entirely **independent library**. It was heavily inspired by the `requests` API, but designed from the ground up to support modern Python features that `requests` lacks, such as:
+* Native `async`/`await` support (alongside a synchronous API).
+* HTTP/2 support.
+* Direct integration with ASGI applications for testing.
+
+### 2. The ""Requests 3.0"" History
+Around 2018–2019, there was an initiative by the creator of Requests (Kenneth Reitz) to develop **Requests 3.0**, which aimed to add async capabilities and HTTP/2 support. 
+
+However, adding async and HTTP/2 to `requests` without breaking backward compatibility for millions of existing Python applications proved extremely difficult. The Requests 3.0 project ultimately stalled. 
+
+Instead of waiting for a massive rewrite of `requests`, the Python community rallied around **`httpx`** as the next-generation HTTP client for async and HTTP/2 use cases.
+
+### 3. Why Requests stuck with `urllib3`
+The maintainers of `psf/requests` prioritize **stability and backward compatibility**. Because `requests` is one of the most downloaded Python packages in the world (used by millions of scripts and production systems), changing its underlying engine from `urllib3` to something else would risk breaking a vast ecosystem of code.
+
+### Summary
+* **`psf/requests`**: Uses **`urllib3`** (synchronous, HTTP/1.1, ultra-stable).
+* **`httpx`**: An **alternative** library (supports sync + async, HTTP/1.1 + HTTP/2, similar API to `requests`).",,,,Yes,n/a,Yes
