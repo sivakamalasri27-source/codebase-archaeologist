@@ -68,7 +68,7 @@ What I take from this:
 - **Rename tracking is a heuristic** and was not formally evaluated.
 - **Merge commits can attach unrelated PR text.** They are not filtered yet.
 - **Slow first query.** Loading the embedding model plus a Gemini call took about 35 seconds. The Streamlit app caches the model after the first load.
-- **LLM availability varies.** Gemini model names change and servers are sometimes busy (404, 503, 429 during development). The app falls back to a structured answer and says so.
+- **LLM availability varies.** Gemini model names change and servers are sometimes busy (404, 503, 429 during development). The app falls back to a structured answer and says so. Benchmark answers and the demo may come from different Gemini models (the demo now uses gemini-3.5-flash-lite).
 
 ## Run it
 

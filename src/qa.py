@@ -47,8 +47,13 @@ from index import search
 # Configuration & Constants
 # ---------------------------------------------------------------------------
 
-# Model name constant as required
-GEMINI_MODEL: str = "gemini-3.5-flash"
+# Model list to try in order
+GEMINI_MODELS: list[str] = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+]
+GEMINI_MODEL: str = GEMINI_MODELS[0]
 
 # Distance threshold: if the top hit is farther than this, abstain from answering
 ABSTAIN_DISTANCE: float = 0.70
@@ -200,72 +205,106 @@ def _build_llm_prompt(question: str, context: str) -> str:
 # Gemini Integration (Official google-genai SDK)
 # ---------------------------------------------------------------------------
 
-def _call_gemini(question: str, context: str) -> tuple[str | None, str | None]:
-    """Call Google Gemini using the official google-genai Python SDK.
+def _parse_error(exc: Exception) -> tuple[int | None, str]:
+    """Extract HTTP status code and a concise message from an API exception."""
+    code = getattr(exc, "code", None)
+    if not isinstance(code, int):
+        status_code = getattr(exc, "status_code", None)
+        if isinstance(status_code, int):
+            code = status_code
+
+    raw_msg = str(getattr(exc, "message", None) or str(exc)).strip()
+
+    if code is None:
+        for c in (503, 504, 429, 401, 403, 404):
+            if str(c) in raw_msg:
+                code = c
+                break
+
+    short_msg = raw_msg.splitlines()[0] if raw_msg else type(exc).__name__
+    if len(short_msg) > 80:
+        short_msg = short_msg[:77] + "..."
+
+    return code, short_msg
+
+
+def _call_gemini(
+    question: str,
+    context: str,
+) -> tuple[str | None, str | None, str]:
+    """Call Google Gemini across GEMINI_MODELS with fallback and retry logic.
 
     Plain English:
-    Reads GEMINI_API_KEY from .env and passes the prompt to Gemini using the
-    current official Google GenAI SDK (`from google import genai`).
-    Returns (answer_text, None) on success, or (None, failure_reason) on failure.
-    If the model is not found, queries and displays available models via SDK.
+    Attempts to generate an answer using the models in GEMINI_MODELS in order.
+    The client is configured with a 60-second timeout and 1 attempt per call.
+    - On transient errors (503, 504, 429): waits 2 seconds, retries the same
+      model once, then falls through to the next model.
+    - On non-retryable errors (401, 403, 404): moves immediately to the next model.
+    Returns:
+        tuple of (answer_text, model_used, failure_reason_string)
+        - answer_text: str if a model succeeded, None if all failed.
+        - model_used: name of the model that answered, or None if all failed.
+        - failure_reason_string: formatted status code and short message for
+          every model that failed (empty string if none failed).
     """
     raw_key = os.getenv("GEMINI_API_KEY", "")
     api_key = raw_key.strip("<> '\"") if raw_key else ""
 
     if not api_key:
-        return None, "GEMINI_API_KEY not found or empty in .env"
+        return None, None, "GEMINI_API_KEY not found or empty in .env"
 
     try:
         from google import genai
         from google.genai import types
     except ImportError:
-        return None, "google-genai SDK not installed (run 'pip install google-genai')"
+        return None, None, "google-genai SDK not installed (run 'pip install google-genai')"
 
     prompt = _build_llm_prompt(question, context)
+    failures: list[str] = []
 
     try:
         client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=25000),
+            http_options=types.HttpOptions(
+                timeout=60000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
         )
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        answer = response.text if response and response.text else ""
-        if not answer.strip():
-            return None, "Gemini returned an empty response"
-        return answer.strip(), None
-    except Exception as exc:
-        err_msg = str(exc)
+    except Exception as init_exc:
+        return None, None, f"ClientInitError: {str(init_exc)[:100]}"
 
-        # Requirement 4: If Gemini returns model-not-found error, print exact error
-        # and query the list of available models using the SDK.
-        if "404" in err_msg or "NOT_FOUND" in err_msg or "not found" in err_msg.lower():
-            print(f"\n[qa] [MODEL ERROR] Gemini model '{GEMINI_MODEL}' was not found.")
-            print(f"[qa] Exact error: {exc}")
-            try:
-                print("[qa] Querying available models via SDK (client.models.list())...")
-                models = list(client.models.list())
-                available_models = [m.name for m in models if getattr(m, "name", None)]
-                print(f"[qa] Available models ({len(available_models)}):")
-                for m_name in available_models[:15]:
-                    print(f"     - {m_name}")
-                if len(available_models) > 15:
-                    print(f"     ... and {len(available_models) - 15} more")
-            except Exception as list_err:
-                print(f"[qa] Could not list models via SDK: {list_err}")
+    for model_name in GEMINI_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+            )
+            answer = response.text if response and response.text else ""
+            if answer.strip():
+                return answer.strip(), model_name, "; ".join(failures)
+            failures.append(f"{model_name}: empty response")
+        except Exception as exc:
+            code, msg = _parse_error(exc)
+            err_str = f"{model_name}: {code or 'ERR'} {msg}"
 
-        if "API key not valid" in err_msg or "UNAUTHENTICATED" in err_msg:
-            err_reason = "API key not valid (401 UNAUTHENTICATED)"
-        elif "RESOURCE_EXHAUSTED" in err_msg or "429" in err_msg:
-            err_reason = "Quota exceeded (429 RESOURCE_EXHAUSTED)"
-        elif "404" in err_msg or "NOT_FOUND" in err_msg:
-            err_reason = f"Model '{GEMINI_MODEL}' not found (404 NOT_FOUND)"
-        else:
-            err_reason = f"{type(exc).__name__}: {err_msg[:120]}"
+            if code in (503, 504, 429):
+                time.sleep(2)
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                    )
+                    answer = response.text if response and response.text else ""
+                    if answer.strip():
+                        return answer.strip(), model_name, "; ".join(failures)
+                    failures.append(f"{model_name} (retry): empty response")
+                except Exception as retry_exc:
+                    r_code, r_msg = _parse_error(retry_exc)
+                    failures.append(f"{model_name}: {r_code or 'ERR'} {r_msg}")
+            else:
+                failures.append(err_str)
 
-        return None, err_reason
+    return None, None, "; ".join(failures)
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +524,8 @@ def ask_detailed(
 
     Keys returned:
         answer              - full answer string
-        model_used          - "gemini", "structured", or "abstained"
+        model_used          - model name (e.g. "gemini-3.5-flash-lite"), "structured", or "abstained"
+        llm_failure_reason  - status code and message for failed models (empty if none failed)
         cited_hashes        - deduplicated hashes cited in the answer (LLM only)
         in_evidence         - count of hashes in the retrieved hits
         exists_in_repo      - count of hashes in ChromaDB but not in hits
@@ -525,6 +565,7 @@ def ask_detailed(
         return {
             "answer": "Not enough evidence in the repo history",
             "model_used": "abstained",
+            "llm_failure_reason": "",
             "cited_hashes": [],
             "in_evidence": 0,
             "exists_in_repo": 0,
@@ -543,6 +584,7 @@ def ask_detailed(
         return {
             "answer": "Not enough evidence in the repo history",
             "model_used": "abstained",
+            "llm_failure_reason": "",
             "cited_hashes": [],
             "in_evidence": 0,
             "exists_in_repo": 0,
@@ -556,13 +598,15 @@ def ask_detailed(
     context = _build_context(hits)
     answer: str | None = None
     backend_used = "structured"
+    llm_failure_reason = ""
 
     if not force_structured:
         t_gem_start = time.time()
-        answer, failure_reason = _call_gemini(question, context)
+        answer, model_name, failure_reason = _call_gemini(question, context)
         t_gemini = time.time() - t_gem_start
-        if answer is not None:
-            backend_used = "gemini"
+        llm_failure_reason = failure_reason
+        if answer is not None and model_name is not None:
+            backend_used = model_name
         else:
             if verbose:
                 print(f"[qa] LLM not used: {failure_reason}")
@@ -585,7 +629,7 @@ def ask_detailed(
     in_repo: list[str] = []
     not_fnd: list[str] = []
 
-    if backend_used == "gemini":
+    if backend_used in GEMINI_MODELS:
         in_ev, in_repo, not_fnd = validate_citations(answer, hits, chroma_dir=chroma_dir)
         cited_hashes = in_ev + in_repo + not_fnd
         if verbose:
@@ -610,6 +654,7 @@ def ask_detailed(
     return {
         "answer": answer,
         "model_used": backend_used,
+        "llm_failure_reason": llm_failure_reason,
         "cited_hashes": cited_hashes,
         "in_evidence": len(in_ev),
         "exists_in_repo": len(in_repo),
@@ -679,14 +724,37 @@ def plain_gemini(
     try:
         client = genai.Client(
             api_key=api_key,
-            http_options=types.HttpOptions(timeout=25000),
+            http_options=types.HttpOptions(
+                timeout=60000,
+                retry_options=types.HttpRetryOptions(attempts=1),
+            ),
         )
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        answer = (response.text or "").strip()
-        if not answer:
+        for model_name in GEMINI_MODELS:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+                answer = (response.text or "").strip()
+                if answer:
+                    break
+            except Exception as exc:
+                code, msg = _parse_error(exc)
+                if code in (503, 504, 429):
+                    time.sleep(2)
+                    try:
+                        response = client.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                        )
+                        answer = (response.text or "").strip()
+                        if answer:
+                            break
+                    except Exception as retry_exc:
+                        error_str = f"{model_name}: {str(retry_exc)[:150]}"
+                else:
+                    error_str = f"{model_name}: {str(exc)[:150]}"
+        if not answer and not error_str:
             error_str = "Gemini returned an empty response"
     except Exception as exc:
         error_str = f"{type(exc).__name__}: {str(exc)[:200]}"

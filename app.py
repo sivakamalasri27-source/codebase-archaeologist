@@ -122,9 +122,13 @@ if st.button("Ask", type="primary"):
         # 1. Answer section
         st.subheader("Answer")
         if result.get("model_used") == "structured":
-            st.info("ℹ️ Gemini LLM was unavailable. Displaying structured fallback built from retrieved repository evidence.")
+            reason = result.get("llm_failure_reason", "")
+            st.info(f"Gemini unavailable: {reason}")
 
         st.markdown(result["answer"])
+
+        if result.get("model_used") not in ("structured", "abstained"):
+            st.caption(result.get("model_used", ""))
 
         # 2. Retrieval & Abstain details
         st.subheader("Retrieval Details")
